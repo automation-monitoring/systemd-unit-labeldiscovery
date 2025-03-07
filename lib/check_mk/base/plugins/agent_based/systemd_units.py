@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-# Copyright (C) 2022 tribe29 GmbH - License: GNU General Public License v2
+# Copyright (C) 2022 Checkmk GmbH - License: GNU General Public License v2
 # This file is part of Checkmk (https://checkmk.com). It is subject to the terms and
 # conditions defined in the file COPYING, which is part of this source code package.
+import re
 from collections import defaultdict
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
+from enum import Enum
+from typing import Any, NamedTuple
+
+# add for label discovery support
+from typing import Optional
 
 from .agent_based_api.v1 import (
     check_levels,
@@ -99,6 +104,7 @@ from .agent_based_api.v1 import HostLabel
 
 
 _SYSTEMD_UNIT_FILE_STATES = [
+    # TODO: alias is missing. is this by accident?
     "enabled",
     "enabled-runtime",
     "linked",
@@ -120,20 +126,129 @@ _SYSTEMD_UNIT_FILE_STATES = [
 _STATUS_SYMBOLS = {"●", "○", "↻", "×", "x", "*"}
 
 
+# See: https://www.freedesktop.org/software/systemd/man/systemd.unit.html
+class UnitTypes(Enum):
+    # When adding new systemd units, keep in mind to extend the gathering of the data via
+    # the linux agent. Currently, we're only querying service and socket.
+    service = "service"
+    socket = "socket"
+
+    @property
+    def suffix(self):
+        return f".{self.value}"
+
+    @property
+    def singular(self):
+        return f"{self.value.capitalize()}"
+
+    @property
+    def plural(self):
+        return f"{self.value.capitalize()}s"
+
+
+@dataclass(frozen=True)
+class UnitStatus:
+    name: str
+    status: str
+    enabled_status: str | None
+    time_since_change: timedelta | None
+
+    @classmethod
+    def from_entry(cls, entry: Sequence[Sequence[str]]) -> "UnitStatus":
+        name = entry[0][1].split(".", 1)[0]
+        enabled_status = entry[1][3].rstrip(";)") if len(entry[1]) >= 4 else None
+
+        time_line = next(
+            (line for line in entry if line[0].lstrip().startswith("Active:")), []
+        )
+        timestr = " ".join(time_line).split(";", 1)[-1]
+        if "ago" in timestr:
+            time_since_change = _parse_time_str(timestr.replace("ago", "").strip())
+        else:
+            time_since_change = None
+        return cls(
+            name=name,
+            status=entry[2][1],
+            time_since_change=time_since_change,
+            enabled_status=enabled_status,
+        )
+
+
+# Warum ist hier ein frozen=False erforderlich?
 @dataclass(frozen=False)
 class UnitEntry:
     name: str
-    loaded_status: str
-    active_status: str
-    current_state: str
+    loaded_status: str  # LOAD   = Reflects whether the unit definition was properly loaded.
+    #                     for example: loaded, not-found, bad-setting, error, masked
+    active_status: str  # ACTIVE = The high-level unit activation state, i.e. generalization of SUB.
+    #                     for example: active, reloading, inactive, failed, activating, deactivating
+    current_state: str  # SUB    = The low-level unit activation state, values depend on unit type.
+    # The list of possible LOAD, ACTIVE, and SUB states is not constant and new systemd releases may
+    # both add and remove values. See systemctl --state=help
     description: str
-    enabled_status: str
-    time_since_change: Optional[timedelta] = None
+    enabled_status: (
+        str | None
+    )  # see "Available unit file states:" in `systemctl --state=help` or _SYSTEMD_UNIT_FILE_STATES
+    time_since_change: timedelta | None = None
+    # add for label discovery support
     auto_label: Optional[bool] = False
     explicit_labels: Optional[list] = None
 
+    @classmethod
+    def _parse_name_and_unit_type(cls, raw: str) -> None | tuple[str, UnitTypes]:
+        """
+        >>> UnitEntry._parse_name_and_unit_type("foobar.service")
+        ('foobar', <UnitTypes.service: 'service'>)
+        >>> UnitEntry._parse_name_and_unit_type("another.bar.service")
+        ('another.bar', <UnitTypes.service: 'service'>)
+        >>> UnitEntry._parse_name_and_unit_type("another.bar.not_a_know_unit") is None
+        True
+        """
+        for unit in UnitTypes:
+            if raw.endswith(unit.suffix):
+                return raw.replace(unit.suffix, ""), unit
+        return None
 
-Section = Mapping[str, UnitEntry]
+    @classmethod
+    def try_parse(
+        cls,
+        row: Sequence[str],
+        enabled_status: Mapping[str, str],
+        status_details: Mapping[str, UnitStatus],
+    ) -> tuple[UnitTypes, "UnitEntry"] | None:
+        if not (name_unit := cls._parse_name_and_unit_type(row[0])):
+            return None
+        name, unit_type = name_unit
+        temp = name[: name.find("@") + 1] if "@" in name else name
+        # Prefer enabled state from the status section over the list-unit-files, it is the actual instantiation of a service
+        # The status section is generated by the agent since a6a979ce and may not be present
+        enabled = (
+            status_details[name].enabled_status
+            if name in status_details
+            else enabled_status.get(f"{temp}{unit_type.suffix}")
+        )
+        remains = " ".join(row[1:])
+        loaded_status, active_status, current_state, descr = remains.split(" ", 3)
+        time_since_change = (
+            status_details[name].time_since_change if name in status_details else None
+        )
+        return unit_type, UnitEntry(
+            name=name,
+            loaded_status=loaded_status,
+            active_status=active_status,
+            current_state=current_state,
+            description=descr,
+            enabled_status=enabled,
+            time_since_change=time_since_change,
+        )
+
+
+Units = Mapping[str, UnitEntry]
+
+
+class Section(NamedTuple):
+    services: Units
+    sockets: Units
 
 
 def _parse_list_unit_files(source: Iterator[Sequence[str]]) -> Mapping[str, str]:
@@ -144,6 +259,19 @@ def _parse_list_unit_files(source: Iterator[Sequence[str]]) -> Mapping[str, str]
     }
 
 
+KWARG_PARSERS = [
+    ("microseconds", regex("([0-9]?[0-9]?[0-9])us"), 1),
+    ("milliseconds", regex("([0-9]?[0-9]?[0-9])ms"), 1),
+    ("seconds", regex("([0-6]?[0-9])s"), 1),
+    ("minutes", regex("([0-6]?[0-9])min"), 1),
+    ("hours", regex("([0-2]?[0-9])h"), 1),
+    ("days", regex("([0-2]?[0-9]) days?"), 1),
+    ("weeks", regex("([0-4]) weeks?"), 1),
+    ("seconds", regex("([0-9]?[0-9]?[0-9]) months?"), int(60 * 60 * 24 * 30.4375)),
+    ("seconds", regex("([0-9]?[0-9]?[0-9]) years?"), int(60 * 60 * 24 * 365.25)),
+]
+
+
 # systemd implementation for generating the time string we want to parse
 # https://github.com/systemd/systemd/blob/c87c30780624df257ed96909a2286b2b933f8c44/src/basic/time-util.c#L417
 #
@@ -151,156 +279,85 @@ def _parse_list_unit_files(source: Iterator[Sequence[str]]) -> Mapping[str, str]
 # https://github.com/systemd/systemd/blob/2afb2f4a9d6a497dfbe1983fbe1bac297a8dc52b/src/basic/time-util.h#L60
 def _parse_time_str(string: str) -> timedelta:
     kwargs: dict[str, int] = defaultdict(int)
-    SEC_PER_MONTH = 2629800
-    SEC_PER_YEAR = 31557600
-    kwarg_parsers = [
-        ("microseconds", regex("([0-9]?[0-9]?[0-9])us"), 1),
-        ("milliseconds", regex("([0-9]?[0-9]?[0-9])ms"), 1),
-        ("seconds", regex("([0-6]?[0-9])s"), 1),
-        ("minutes", regex("([0-6]?[0-9])min"), 1),
-        ("hours", regex("([0-2]?[0-9])h"), 1),
-        ("days", regex("([0-2]?[0-9]) days?"), 1),
-        ("weeks", regex("([0-4]) weeks?"), 1),
-        ("seconds", regex("([0-9]?[0-9]?[0-9]) months?"), SEC_PER_MONTH),
-        ("seconds", regex("([0-9]?[0-9]?[0-9]) years?"), SEC_PER_YEAR),
-    ]
-    for time_unit, rgx, scale in kwarg_parsers:
+
+    for time_unit, rgx, scale in KWARG_PARSERS:
         if match := rgx.search(string):
             kwargs[time_unit] += scale * int(match.groups()[0])
 
     return timedelta(**kwargs)
 
 
-@dataclass(frozen=True)
-class UnitStatus:
-    name: str
-    status: str
-    time_since_change: Optional[timedelta]
-
-    @classmethod
-    def from_entry(cls, entry: Sequence[Sequence[str]]) -> "UnitStatus":
-        name = entry[0][1].split(".", 1)[0]
-        timestr = " ".join(entry[2]).split(";", 1)[-1]
-        if "ago" in timestr:
-            time_since_change = _parse_time_str(timestr.replace("ago", "").strip())
-        else:
-            time_since_change = None
-        return cls(name=name, status=entry[2][1], time_since_change=time_since_change)
-
-
 def _parse_all(
     source: Iterable[list[str]],
     enabled_status: Mapping[str, str],
     status_details: Mapping[str, UnitStatus],
-) -> Optional[Section]:
-    parsed: dict[str, UnitEntry] = {}
+) -> Section:
+    services: dict[str, UnitEntry] = {}
+    sockets: dict[str, UnitEntry] = {}
     for row in source:
         if row[0] in _STATUS_SYMBOLS:
             row = row[1:]
-        if row[0].endswith(".service"):
-            name = row[0].replace(".service", "")
-            temp = name[: name.find("@") + 1] if "@" in name else name
-            enabled = enabled_status.get(f"{temp}.service", "unknown")
-            remains = " ".join(row[1:])
-            loaded_status, active_status, current_state, descr = remains.split(" ", 3)
-            time_since_change = (
-                status_details[name].time_since_change
-                if name in status_details
-                else None
-            )
-            unit = UnitEntry(
-                name,
-                loaded_status,
-                active_status,
-                current_state,
-                descr,
-                enabled,
-                time_since_change=time_since_change,
-            )
-            parsed[unit.name] = unit
-    if parsed == {}:
-        return None
-    return parsed
+        if result := UnitEntry.try_parse(row, enabled_status, status_details):
+            unit_type, unit = result
+            if unit_type is UnitTypes.service:
+                services[unit.name] = unit
+            if unit_type is UnitTypes.socket:
+                sockets[unit.name] = unit
+    return Section(services=services, sockets=sockets)
 
 
 def _is_service_entry(entry: Sequence[Sequence[str]]) -> bool:
-    unit = entry[0][1]
+    try:
+        unit = entry[0][1]
+    except IndexError:
+        return False
     return unit.endswith(".service")
 
 
-def _is_new_entry(line: Sequence[str]) -> bool:
-    return (line[0] in _STATUS_SYMBOLS) and (len(line) > 3) and ("." in str(line[1]))
+SERVICE_REGEX = re.compile(
+    r".+\.(service|socket|device|mount|automount|swap|target|path|timer|slice|scope)$"
+)
+# hopefully all possible unit types as described in https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html#Description
+
+
+def _is_new_entry(line: Sequence[str], entry: list[Sequence[str]]) -> bool:
+    # First check if we're not looking at a "Triggers" section.
+    # It looks like the beginning of a new status entry, e.g.:
+    # "Triggers: ● check-mk-agent@3148-1849349-997.service",
+    # "● check-mk-agent@3149-1849349-997.service",
+    for elem in reversed(entry):
+        if elem[0].startswith("Triggers:"):
+            return False
+        if elem[0] not in _STATUS_SYMBOLS:
+            break
+    return (
+        (line[0] in _STATUS_SYMBOLS)
+        and (len(line) >= 2)
+        and (bool(SERVICE_REGEX.match(str(line[1]))))
+    )
 
 
 def _parse_status(source: Iterator[Sequence[str]]) -> Mapping[str, UnitStatus]:
     unit_status = {}
     entry: list[Sequence[str]] = []
     for line in source:
-        if _is_new_entry(line):
-            if entry != [] and _is_service_entry(entry):
+        if _is_new_entry(line, entry):
+            if entry and _is_service_entry(entry):
                 status = UnitStatus.from_entry(entry)
                 unit_status[status.name] = status
             entry = [
                 line,
             ]
             continue
-        if line[0].startswith("[all]"):
-            break
         entry.append(line)
-    if len(entry) > 1:
+    if len(entry) > 1 and _is_service_entry(entry):
         status = UnitStatus.from_entry(entry)
         unit_status[status.name] = status
 
     return unit_status
 
 
-def _discovery_systemd_units(params, section):
-    # Filter out volatile systemd service units created by the Checkmk agent which appear and
-    # disappear frequently. No matter what the user configures, we do not want to discover them.
-    filtered_services = [
-        service
-        for service in section.values()
-        if not regex("^check-mk-agent@.+").match(service.name)
-    ]
-
-    def regex_match(what: Sequence[str], name: str) -> bool:
-        if not what:
-            return True
-        for entry in what:
-            if entry.startswith("~"):
-                if regex(entry[1:]).match(name):
-                    return True
-                continue
-            if entry == name:
-                return True
-        return False
-
-    def state_match(rule_states: Sequence[str], state: str) -> bool:
-        if not rule_states:
-            return True
-        return any(s in (None, state) for s in rule_states)
-
-    # defaults are always last and empty to apeace the new api
-    for service in filtered_services:
-        for settings in params:
-            descriptions = settings.get("descriptions", [])
-            names = settings.get("names", [])
-            states = settings.get("states", [])
-            if (
-                regex_match(descriptions, service.description)
-                and regex_match(names, service.name)
-                and state_match(states, service.active_status)
-            ):
-                # yield service.name
-                if settings.get("host_labels_auto", False):
-                    service.auto_label = True
-                if settings.get("host_labels_explicit", None):
-                    service.explicit_labels = settings.get("host_labels_explicit")
-                yield service
-                continue
-
-
-def parse(string_table: StringTable) -> Optional[Section]:
+def parse(string_table: StringTable) -> Section | None:
     if not string_table:
         return None
     # This is a hack to know about possible markers that start a new section. Just looking for a "[" is
@@ -324,30 +381,38 @@ def parse(string_table: StringTable) -> Optional[Section]:
 
 
 def labeldiscovery_systemd_units(params: Sequence[Mapping[str, Any]], section: Section):
-    for service in _discovery_systemd_units(params, section):
-        if service.auto_label:
-            yield HostLabel(f"cmk/systemd/{service.name}", "true")
+    filtered_units = [
+        unit_entry
+        for unit_entry in section.services.values()
+        if not regex("^check-mk-agent@.+").match(unit_entry.name)
+    ]
+    for unit in _systemd_units_for_discovery(params, filtered_units):
+        # for service in discovery_systemd_units_services(params, section):
+        if unit.auto_label:
+            yield HostLabel(f"cmk/systemd/{unit.name}", "true")
 
-        if service.explicit_labels:
-            for k, v in service.explicit_labels.items():
+        if unit.explicit_labels:
+            for k, v in unit.explicit_labels.items():
                 yield HostLabel(str(k), str(v))
 
 
+# register.agent_section(name="systemd_units", parse_function=parse)
 register.agent_section(
     name="systemd_units",
     parse_function=parse,
-    host_label_ruleset_name="discovery_systemd_units_services_rules",
+    host_label_ruleset_name="discovery_systemd_units_services",
     host_label_function=labeldiscovery_systemd_units,
     host_label_default_parameters={"names": ["(never discover)^"]},
     host_label_ruleset_type=register.RuleSetType.ALL,
 )
 
-#   .--services------------------------------------------------------------.
-#   |                                     _                                |
-#   |                 ___  ___ _ ____   _(_) ___ ___  ___                  |
-#   |                / __|/ _ \ '__\ \ / / |/ __/ _ \/ __|                 |
-#   |                \__ \  __/ |   \ V /| | (_|  __/\__ \                 |
-#   |                |___/\___|_|    \_/ |_|\___\___||___/                 |
+
+#   .--units---------------------------------------------------------------.
+#   |                                    _ _                               |
+#   |                        _   _ _ __ (_) |_ ___                         |
+#   |                       | | | | '_ \| | __/ __|                        |
+#   |                       | |_| | | | | | |_\__ \                        |
+#   |                        \__,_|_| |_|_|\__|___/                        |
 #   |                                                                      |
 #   '----------------------------------------------------------------------'
 
@@ -355,70 +420,167 @@ register.agent_section(
 def discovery_systemd_units_services(
     params: Sequence[Mapping[str, Any]], section: Section
 ) -> DiscoveryResult:
-    for service in _discovery_systemd_units(params, section):
-        yield Service(item=service.name)
+    # Filter out volatile systemd service created by the Checkmk agent which appear and
+    # disappear frequently. No matter what the user configures, we do not want to discover them.
+    filtered_services = [
+        unit_entry
+        for unit_entry in section.services.values()
+        if not regex("^check-mk-agent@.+").match(unit_entry.name)
+    ]
+    yield from discovery_systemd_units(params, filtered_services)
 
 
-def check_systemd_units_services(
+def discovery_systemd_units_sockets(
+    params: Sequence[Mapping[str, Any]], section: Section
+) -> DiscoveryResult:
+    yield from discovery_systemd_units(params, list(section.sockets.values()))
+
+
+def _systemd_units_for_discovery(
+    params: Sequence[Mapping[str, Any]], units: Sequence[UnitEntry]
+) -> Sequence[UnitEntry]:
+    def regex_match(what: Sequence[str], name: str) -> bool:
+        if not what:
+            return True
+        for entry in what:
+            if entry.startswith("~"):
+                if regex(entry[1:]).match(name):
+                    return True
+                continue
+            if entry == name:
+                return True
+        return False
+
+    def state_match(rule_states: Sequence[str], state: str) -> bool:
+        if not rule_states:
+            return True
+        return any(s in (None, state) for s in rule_states)
+
+    # defaults are always last and empty to apeace the new api
+    for unit in units:
+        for settings in params:
+            descriptions = settings.get("descriptions", [])
+            names = settings.get("names", [])
+            states = settings.get("states", [])
+            if (
+                regex_match(descriptions, unit.description)
+                and regex_match(names, unit.name)
+                and state_match(states, unit.active_status)
+            ):
+                if settings.get("host_labels_auto", False):
+                    unit.auto_label = True
+                if settings.get("host_labels_explicit", None):
+                    unit.explicit_labels = settings.get("host_labels_explicit")
+                yield unit
+
+
+def discovery_systemd_units(
+    params: Sequence[Mapping[str, Any]], units: Sequence[UnitEntry]
+) -> DiscoveryResult:
+    for unit in _systemd_units_for_discovery(params, units):
+        yield Service(item=unit.name)
+
+
+def check_systemd_services(
     item: str, params: Mapping[str, Any], section: Section
 ) -> CheckResult:
-    # A service found in the discovery phase can vanish in subsequent runs. I.e. the systemd service was deleted during an update
-    if item not in section:
-        yield Result(state=State(params["else"]), summary="Service not found")
-        return
-    service = section[item]
-    # TODO: this defaults unkown states to CRIT with the default params
-    state = params["states"].get(service.active_status, params["states_default"])
-    yield Result(state=State(state), summary=f"Status: {service.active_status}")
-    yield Result(state=State.OK, summary=service.description)
+    yield from check_systemd_units(item, params, section.services)
 
+
+def check_systemd_sockets(
+    item: str, params: Mapping[str, Any], section: Section
+) -> CheckResult:
+    yield from check_systemd_units(item, params, section.sockets)
+
+
+def check_systemd_units(
+    item: str, params: Mapping[str, Any], units: Units
+) -> CheckResult:
+    # A service found in the discovery phase can vanish in subsequent runs. I.e. the systemd service was deleted during an update
+    if item not in units:
+        yield Result(
+            state=State(params["else"]),
+            summary="Unit not found",
+            details="Only units currently in memory are found. These can be shown with `systemctl --all --type service --type socket`.",
+        )
+        return
+    unit = units[item]
+    # TODO: this defaults unknown states to CRIT with the default params
+    state = params["states"].get(unit.active_status, params["states_default"])
+    yield Result(state=State(state), summary=f"Status: {unit.active_status}")
+    yield Result(state=State.OK, summary=unit.description)
+
+
+CHECK_DEFAULT_PARAMETERS = {
+    "states": {
+        "active": 0,
+        "inactive": 0,
+        "failed": 2,
+    },
+    "states_default": 2,
+    "else": 2,  # misleading name, used if service vanishes
+}
+
+DISCOVERY_DEFAULT_PARAMETERS = {"names": ["(never discover)^"]}
 
 register.check_plugin(
     name="systemd_units_services",
     sections=["systemd_units"],
     service_name="Systemd Service %s",
-    check_ruleset_name="systemd_services",
+    check_ruleset_name="systemd_units_services",
     discovery_function=discovery_systemd_units_services,
-    discovery_default_parameters={"names": ["(never discover)^"]},
-    discovery_ruleset_name="discovery_systemd_units_services_rules",
+    discovery_default_parameters=DISCOVERY_DEFAULT_PARAMETERS,
+    discovery_ruleset_name="discovery_systemd_units_services",
     discovery_ruleset_type=register.RuleSetType.ALL,
-    check_function=check_systemd_units_services,
-    check_default_parameters={
-        "states": {
-            "active": 0,
-            "inactive": 0,
-            "failed": 2,
-        },
-        "states_default": 2,
-        "else": 2,  # missleading name, used if service vanishes
-    },
+    check_function=check_systemd_services,
+    check_default_parameters=CHECK_DEFAULT_PARAMETERS,
+)
+register.check_plugin(
+    name="systemd_units_sockets",
+    sections=["systemd_units"],
+    service_name="Systemd Socket %s",
+    check_ruleset_name="systemd_units_sockets",
+    discovery_function=discovery_systemd_units_sockets,
+    discovery_default_parameters=DISCOVERY_DEFAULT_PARAMETERS,
+    discovery_ruleset_name="discovery_systemd_units_sockets",
+    discovery_ruleset_type=register.RuleSetType.ALL,
+    check_function=check_systemd_sockets,
+    check_default_parameters=CHECK_DEFAULT_PARAMETERS,
 )
 
 
 def discovery_systemd_units_services_summary(section: Section) -> DiscoveryResult:
-    yield Service(item="Summary")
+    yield Service()
+
+
+def discovery_systemd_units_sockets_summary(section: Section) -> DiscoveryResult:
+    yield Service()
 
 
 def _services_split(
     services: Iterable[UnitEntry], blacklist: Sequence[str]
 ) -> Mapping[str, list[UnitEntry]]:
     services_organised: dict[str, list[UnitEntry]] = {
-        "included": [],
-        "excluded": [],
-        "disabled": [],
+        # early exit:
+        "excluded": [],  # based on configured regex
+        # based on active_status:
         "activating": [],
         "deactivating": [],
         "reloading": [],
+        # based on enabled_status:
+        "disabled": [],  # includes also indirect
         "static": [],
+        # fallback
+        "included": [],  # all others
     }
     compiled_patterns = [regex(p) for p in blacklist]
     for service in services:
         if any(expr.match(service.name) for expr in compiled_patterns):
             services_organised["excluded"].append(service)
             continue
-        if service.active_status in ("activating", "deactivating"):
+        if service.active_status in ("reloading", "activating", "deactivating"):
             services_organised[service.active_status].append(service)
-        elif service.enabled_status in ("reloading", "disabled", "static", "indirect"):
+        elif service.enabled_status in ("disabled", "static", "indirect"):
             service_type = (
                 "disabled"
                 if service.enabled_status == "indirect"
@@ -431,7 +593,10 @@ def _services_split(
 
 
 def _check_temporary_state(
-    services: Iterable[UnitEntry], params: Mapping[str, Any], service_state: str
+    services: Iterable[UnitEntry],
+    params: Mapping[str, Any],
+    service_state: str,
+    unit_type: UnitTypes,
 ) -> CheckResult:
     levels = params[f"{service_state}_levels"]
     for service in services:
@@ -442,13 +607,16 @@ def _check_temporary_state(
             elapsed_time.total_seconds(),
             levels_upper=levels,
             render_func=render.timespan,
-            label=f"Service '{service.name}' {service_state} for",
+            label=f"{unit_type.singular} '{service.name}' {service_state} for",
             notice_only=True,
         )
 
 
 def _check_non_ok_services(
-    systemd_services: Iterable[UnitEntry], params: Mapping[str, Any], output_string: str
+    systemd_services: Iterable[UnitEntry],
+    params: Mapping[str, Any],
+    output_string: str,
+    unit_type: UnitTypes,
 ) -> Iterable[Result]:
     servicenames_by_status: dict[Any, Any] = {}
     for service in systemd_services:
@@ -466,42 +634,65 @@ def _check_non_ok_services(
         services_text = ", ".join(sorted(service_names))
         info = output_string.format(
             count=count,
-            is_plural="" if count == 1 else "s",
             status=status,
             service_text=services_text,
+            unit_type=unit_type.singular.casefold()
+            if count == 1
+            else unit_type.plural.casefold(),
         )
 
         yield Result(state=State(state), summary=info)
 
 
 def check_systemd_units_services_summary(
-    item: str, params: Mapping[str, Any], section: Section
+    params: Mapping[str, Any], section: Section
 ) -> CheckResult:
-    services = section.values()
+    yield from check_systemd_units_summary(
+        params, list(section.services.values()), unit_type=UnitTypes.service
+    )
+
+
+def check_systemd_units_sockets_summary(
+    params: Mapping[str, Any], section: Section
+) -> CheckResult:
+    yield from check_systemd_units_summary(
+        params, list(section.sockets.values()), unit_type=UnitTypes.socket
+    )
+
+
+def check_systemd_units_summary(
+    params: Mapping[str, Any], units: Sequence[UnitEntry], unit_type: UnitTypes
+) -> CheckResult:
     blacklist = params["ignored"]
-    yield Result(state=State.OK, summary=f"Total: {len(services):d}")
-    services_organised = _services_split(services, blacklist)
+    yield Result(state=State.OK, summary=f"Total: {len(units):d}")
+    services_organised = _services_split(units, blacklist)
     yield Result(
         state=State.OK, summary=f"Disabled: {len(services_organised['disabled']):d}"
     )
-    # some of the failed ones might be ignored, so this is OK:
+
     yield Result(
-        state=State.OK,
-        summary=f"Failed: {sum(s.active_status == 'failed' for s in services):d}",
-    )
-    included_template = "{count:d} service{is_plural} {status} ({service_text})"
-    yield from _check_non_ok_services(
-        services_organised["included"], params, included_template
+        state=State(params["states"].get("failed", params["states_default"]))
+        if (number_of_failed_units := sum(s.active_status == "failed" for s in units))
+        else State.OK,
+        summary=f"Failed: {number_of_failed_units:d}",
     )
 
-    static_template = "{count:d} static service{is_plural} {status} ({service_text})"
+    included_template = "{count:d} {unit_type} {status} ({service_text})"
     yield from _check_non_ok_services(
-        services_organised["static"], params, static_template
+        services_organised["included"], params, included_template, unit_type
+    )
+
+    static_template = "{count:d} static {unit_type} {status} ({service_text})"
+    yield from _check_non_ok_services(
+        services_organised["static"], params, static_template, unit_type
     )
 
     for temporary_type in ("activating", "reloading", "deactivating"):
         yield from _check_temporary_state(
-            services_organised[temporary_type], params, temporary_type
+            services_organised[temporary_type],
+            params,
+            temporary_type,
+            UnitTypes.service,
         )
     if services_organised["excluded"]:
         yield Result(
@@ -509,23 +700,35 @@ def check_systemd_units_services_summary(
         )
 
 
+CHECK_DEFAULT_PARAMETERS_SUMMARY = {
+    "states": {
+        "active": 0,
+        "inactive": 0,
+        "failed": 2,
+    },
+    "states_default": 2,
+    "activating_levels": None,
+    "deactivating_levels": (30, 60),
+    "reloading_levels": (30, 60),
+    "ignored": [],
+}
+
 register.check_plugin(
     name="systemd_units_services_summary",
     sections=["systemd_units"],
     discovery_function=discovery_systemd_units_services_summary,
     check_function=check_systemd_units_services_summary,
     check_ruleset_name="systemd_services_summary",
-    service_name="Systemd Service %s",
-    check_default_parameters={
-        "states": {
-            "active": 0,
-            "inactive": 0,
-            "failed": 2,
-        },
-        "states_default": 2,
-        "activating_levels": None,
-        "deactivating_levels": (30, 60),
-        "reloading_levels": (30, 60),
-        "ignored": [],
-    },
+    service_name="Systemd Service Summary",
+    check_default_parameters=CHECK_DEFAULT_PARAMETERS_SUMMARY,
+)
+
+register.check_plugin(
+    name="systemd_units_sockets_summary",
+    sections=["systemd_units"],
+    discovery_function=discovery_systemd_units_sockets_summary,
+    check_function=check_systemd_units_sockets_summary,
+    check_ruleset_name="systemd_sockets_summary",
+    service_name="Systemd Socket Summary",
+    check_default_parameters=CHECK_DEFAULT_PARAMETERS_SUMMARY,
 )
